@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
 
-from app.api.v1.routes import analytics, auth, dashboard, tickets, vip
+from app.api.v1.routes import analytics, auth, dashboard, tickets, vip, imports
 from app.api.v1.ws_manager import manager as ws_manager
 from app.core.config import settings
 from app.core.database import close_db, init_db
@@ -174,6 +174,7 @@ PREFIX = settings.API_V1_PREFIX
 
 app.include_router(auth.router,      prefix=PREFIX)
 app.include_router(tickets.router,   prefix=PREFIX)
+app.include_router(imports.router,   prefix=PREFIX)
 app.include_router(vip.router,       prefix=PREFIX)
 app.include_router(dashboard.router, prefix=PREFIX)
 app.include_router(analytics.router, prefix=PREFIX)
