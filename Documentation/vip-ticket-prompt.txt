@@ -1,0 +1,642 @@
+**Model assignments:**
+- `llama-3.1-8b-instant` → Intake agent (fast, lightweight parsing)
+- `llama-3.3-70b-versatile` → Priority, Routing, SLA, Explainability agents (heavy reasoning)
+- VIP Detection → pure rule/DB logic (no LLM cost needed)
+- Notification Agent → template-based (no LLM)
+
+
+## Phase 1 — Project Scaffold & Infrastructure
+**Prompt 1.1 — Backend scaffold**
+
+Create a production-grade FastAPI project with this exact structure:
+
+vipulse-backend/
+  app/
+    api/
+      v1/
+        routes/
+          tickets.py
+          auth.py
+          vip.py
+          dashboard.py
+          analytics.py
+    agents/
+      base_agent.py
+      intake_agent.py
+      vip_agent.py
+      priority_agent.py
+      routing_agent.py
+      sla_agent.py
+      explainability_agent.py
+      notification_agent.py
+    core/
+      config.py          # Pydantic BaseSettings with .env
+      security.py        # JWT + bcrypt
+      database.py        # Motor async MongoDB + Beanie ODM
+      redis_client.py    # aioredis connection pool
+      logging.py         # structlog JSON logger
+    models/
+      ticket.py
+      employee.py
+      user.py
+    schemas/
+      ticket_schemas.py
+      auth_schemas.py
+    orchestrator/
+      graph.py           # LangGraph StateGraph definition
+      state.py           # TypedDict AgentState
+    services/
+      ticket_service.py
+      notification_service.py
+    utils/
+      exceptions.py      # custom HTTPException subclasses
+      response.py        # standard API envelope
+  tests/
+    conftest.py
+    test_tickets.py
+    test_agents.py
+  .env.example
+  requirements.txt
+  Dockerfile
+  docker-compose.yml
+  main.py
+
+Requirements.txt must include:
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+motor==3.4.0
+beanie==1.25.0
+redis==5.0.4
+aioredis==2.0.1
+pydantic==2.7.1
+pydantic-settings==2.2.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+langchain==0.2.0
+langchain-groq==0.1.3
+langgraph==0.1.1
+httpx==0.27.0
+structlog==24.1.0
+python-multipart==0.0.9
+jinja2==3.1.4
+aiosmtplib==3.0.1
+sentry-sdk[fastapi]==2.1.1
+
+In config.py use Pydantic BaseSettings reading from .env:
+MONGODB_URL, REDIS_URL, GROQ_API_KEY, SECRET_KEY, DISCORD_WEBHOOK_URL,
+GMAIL_USER, GMAIL_APP_PASSWORD, SENTRY_DSN, ENVIRONMENT
+
+In main.py wire up:
+- CORS with origins from config
+- Sentry middleware
+- structlog middleware logging every request with trace_id, latency, status
+- Startup event: init Beanie with all document models, ping Redis
+- All routers mounted at /api/v1/
+- Global exception handler returning {"success": false, "error": "...", "trace_id": "..."}
+
+**Prompt 1.2 — MongoDB Beanie models**
+Create production Beanie ODM document models for VIPulse AI.
+In app/models/ticket.py:
+class TicketStatus(str, Enum): OPEN, IN_PROGRESS, RESOLVED, ESCALATED, SLA_BREACHED
+class Priority(str, Enum): LOW, MEDIUM, HIGH, CRITICAL
+class VIPLevel(str, Enum): STANDARD, SILVER, GOLD, PLATINUM
+class Ticket(Document):
+    ticket_id: str                          # auto-generated T-{uuid4 first 8 chars}
+    employee_id: str
+    employee_name: str
+    role: str
+    department: str
+    issue_title: str
+    issue_description: str
+    severity: str
+    category: Optional[str]                 # AI-classified
+    subcategory: Optional[str]
+    priority: Priority = Priority.MEDIUM
+    priority_score: float = 0.0             # 0-100
+    vip_detected: bool = False
+    vip_level: Optional[VIPLevel]
+    vip_confidence: float = 0.0
+    urgency_level: str = "low"
+    business_impact: str = "minimal"
+    assigned_team: Optional[str]
+    assigned_agent: Optional[str]
+    sla_risk_score: float = 0.0             # 0-100
+    sla_deadline: Optional[datetime]
+    ai_reasoning: List[str] = []            # explainability bullet points
+    status: TicketStatus = TicketStatus.OPEN
+    discord_notified: bool = False
+    email_notified: bool = False
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    resolved_at: Optional[datetime]
+    created_by: str                         # user_id
+    class Settings:
+        name = "tickets"
+        indexes = [
+            IndexModel([("ticket_id", 1)], unique=True),
+            IndexModel([("employee_id", 1)]),
+            IndexModel([("priority", 1), ("created_at", -1)]),
+            IndexModel([("vip_detected", 1)]),
+            IndexModel([("status", 1)]),
+            IndexModel([("created_at", -1)]),
+        ]
+
+In app/models/employee.py:
+
+class Employee(Document):
+    employee_id: str
+    name: str
+    email: str
+    role: str
+    department: str
+    vip_level: VIPLevel = VIPLevel.STANDARD
+    vip_score_override: Optional[float]
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+    class Settings:
+        name = "vip_employees"
+        indexes = [IndexModel([("employee_id", 1)], unique=True), IndexModel([("email", 1)], unique=True)]
+
+In app/models/user.py (admin/support users):
+
+class UserRole(str, Enum): ADMIN, SUPPORT_AGENT, MANAGER, VIEWER
+
+class User(Document):
+    user_id: str
+    username: str
+    email: str
+    hashed_password: str
+    role: UserRole = UserRole.SUPPORT_AGENT
+    is_active: bool = True
+    created_at: datetime
+    last_login: Optional[datetime]
+
+    class Settings:
+        name = "users"
+        indexes = [IndexModel([("email", 1)], unique=True)]
+
+## Phase 2 — LangGraph Multi-Agent Orchestrator
+**Prompt 2.1 — Agent state and base**
+Create the LangGraph orchestration layer for VIPulse AI.
+In app/orchestrator/state.py:
+from typing import TypedDict, Optional, List, Annotated
+import operator
+class AgentState(TypedDict):
+    # Input
+    ticket_id: str
+    employee_id: str
+    employee_name: str
+    role: str
+    department: str
+    issue_title: str
+    issue_description: str
+    severity: str
+    # VIP Detection outputs
+    vip_detected: bool
+    vip_level: str
+    vip_confidence: float
+    vip_score_breakdown: dict
+    # Priority outputs
+    priority_score: float
+    priority_label: str
+    priority_factors: List[str]
+    # Urgency outputs
+    urgency_level: str
+    business_impact: str
+    detected_keywords: List[str]
+    # Categorization
+    category: str
+    subcategory: str
+    # Routing
+    assigned_team: str
+    routing_reason: str
+    # SLA
+    sla_risk_score: float
+    sla_risk_level: str
+    sla_risk_factors: List[str]
+    sla_deadline_hours: int
+    # Explainability
+    ai_reasoning: List[str]
+    full_explanation: str
+    # Notifications
+    discord_sent: bool
+    email_sent: bool
+    # Errors
+    errors: Annotated[List[str], operator.add]
+In app/agents/base_agent.py:
+Create an abstract BaseAgent class:
+- __init__ receives model_name: str, temperature: float = 0.1
+- self.llm = ChatGroq(model=model_name, temperature=temperature, groq_api_key=settings.GROQ_API_KEY)
+- abstract async def run(state: AgentState) -> AgentState
+- _call_llm(messages) method with retry logic: 3 retries, exponential backoff 1s/2s/4s
+- structured error appending to state["errors"] on failure
+- structlog logger per agent class
+**Prompt 2.2 — All six agents**
+Implement all 6 VIPulse AI agents. Each extends BaseAgent from app/agents/base_agent.py.
+--- AGENT 1: intake_agent.py ---
+Model: llama-3.1-8b-instant
+Purpose: parse and normalize ticket, classify category/subcategory
+System prompt:
+"You are a ticket intake classifier. Given a support ticket, extract:
+1. category (Network/Hardware/Software/Access/Security/Payroll/Other)
+2. subcategory (specific type within category, e.g. VPN Failure)
+3. cleaned issue summary (1 sentence)
+4. detected_urgent_keywords (list of any urgency words found: urgent, critical, down, failed, blocked, production, stopped, breach)
+Respond ONLY as JSON: {category, subcategory, cleaned_summary, detected_keywords}"
+User message: f"Title: {state['issue_title']}\nDescription: {state['issue_description']}"
+Parse JSON response and update state. On parse error, use fallback values.
+--- AGENT 2: vip_agent.py ---
+Model: No LLM (pure rule-based + DB lookup)
+Purpose: detect VIP status from employee DB + role scoring
+
+VIP scoring rules (deterministic, no LLM):
+BASE_SCORES = {
+    "C-Level/CEO/CTO/CFO/COO": 50,
+    "VP/Vice President": 45,
+    "Director": 40,
+    "Senior Manager/Manager": 25,
+    "Lead/Principal": 15,
+}
+DEPT_SCORES = {
+    "Finance": 20, "Security": 20, "Legal": 18, "HR": 15, "IT": 12,
+}
+VIP_LEVELS = {"PLATINUM": 80, "GOLD": 60, "SILVER": 40, "STANDARD": 0}
+Algorithm:
+1. Query MongoDB Employee collection by employee_id
+2. If found and has vip_score_override, use that
+3. Else compute: role_score + dept_score + (10 if employee.vip_level != STANDARD)
+4. Normalize to 0-100 confidence
+5. Determine VIP level from VIP_LEVELS thresholds
+6. Set state vip_detected = True if confidence >= 40
+--- AGENT 3: priority_agent.py ---
+Model: llama-3.3-70b-versatile
+Purpose: compute 0-100 priority score with weighted factors
+Build scoring prompt:
+"You are a priority scoring engine. Given ticket data, calculate a priority score 0-100.
+Apply these weights:
+- vip_score contribution: {vip_confidence * 0.35}
+- issue severity (critical=30, high=20, medium=10, low=5): based on '{severity}'
+- urgency_keywords found: {len(detected_keywords) * 5} (max 20)
+- business_hours factor (if 9am-6pm IST +10, else +5)
+- category criticality (Network/Security=+15, Access=+10, Software=+8, other=+5)
+Output ONLY JSON: {priority_score: float, priority_label: 'LOW|MEDIUM|HIGH|CRITICAL', priority_factors: [list of factor strings explaining the score]}"
+Map score to label: 0-30=LOW, 31-60=MEDIUM, 61-80=HIGH, 81-100=CRITICAL
+--- AGENT 4: routing_agent.py ---
+Model: llama-3.3-70b-versatile
+Purpose: assign correct support team
+Routing rules (inject as context into prompt):
+ROUTING_RULES = {
+    "Network": "Infrastructure Support Team",
+    "VPN": "Infrastructure Support Team",
+    "Access": "Identity & Access Management (IAM) Team",
+    "Security": "Security Operations Center (SOC)",
+    "Payroll": "Finance IT Team",
+    "Hardware": "Desktop Support Team",
+    "Software": "Application Support Team",
+    "Email": "Collaboration Tools Team",
+}
+
+Prompt: "Given ticket category={category}, subcategory={subcategory}, role={role}, department={department},
+and these routing rules: {ROUTING_RULES}
+Select the best team. Consider department-specific overrides for VIP employees.
+Output ONLY JSON: {assigned_team: string, routing_reason: string (1 sentence)}"
+--- AGENT 5: sla_agent.py ---
+Model: llama-3.3-70b-versatile
+Purpose: predict SLA breach risk and set deadline
+SLA_DEADLINES = {
+    "CRITICAL": 2,   # hours
+    "HIGH": 4,
+    "MEDIUM": 8,
+    "LOW": 24,
+}
+VIP_MULTIPLIER = 0.5 (VIP tickets get half the deadline)
+Prompt: "Given:
+- priority_label: {priority_label}
+- vip_detected: {vip_detected}
+- assigned_team: {assigned_team} (check if this team is currently overloaded - assume normal load)
+- urgency_level: {urgency_level}
+- ticket_age_minutes: 0 (new ticket)
+Calculate:
+- sla_risk_score: 0-100 (higher = more likely to breach)
+- risk_level: LOW/MEDIUM/HIGH/CRITICAL
+- sla_risk_factors: list of reasons
+- sla_deadline_hours: int
+Output ONLY JSON: {sla_risk_score, risk_level, sla_risk_factors, sla_deadline_hours}"
+--- AGENT 6: explainability_agent.py ---
+Model: llama-3.3-70b-versatile
+Purpose: generate human-readable AI decision explanation
+Prompt: "You are an AI explainability engine for an IT support system.
+Given all decisions made about this ticket:
+- employee: {employee_name}, role: {role}, dept: {department}
+- vip_detected: {vip_detected}, vip_level: {vip_level}, confidence: {vip_confidence}%
+- category: {category}/{subcategory}
+- urgency_keywords found: {detected_keywords}
+- priority_score: {priority_score} → {priority_label}
+- assigned_team: {assigned_team}
+- sla_risk: {sla_risk_score}% ({sla_risk_level})
+Generate EXACTLY 4-6 concise bullet points explaining WHY the AI made these decisions.
+Each bullet must start with a checkmark word (Detected/Identified/Calculated/Assigned/Predicted/Flagged).
+Output ONLY JSON: {ai_reasoning: [list of strings], full_explanation: string (2-3 sentences paragraph)}"
+**Prompt 2.3 — LangGraph StateGraph**
+Wire all agents into a LangGraph StateGraph in app/orchestrator/graph.py.
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+Build graph:
+1. Create StateGraph(AgentState)
+2. Add nodes: "intake", "vip_detection", "priority_scoring", "routing", "sla_prediction", "explainability", "notification"
+3. Edge flow:
+   START → intake → vip_detection → priority_scoring → routing → sla_prediction → explainability → notification → END
+4. Add conditional edge after priority_scoring:
+   - If priority_label == "CRITICAL" AND vip_detected → skip directly to notification (fast-track)
+   - Else → continue normal flow
+5. Compile graph with MemorySaver checkpointer
+6. Export async function: process_ticket(ticket_data: dict) -> AgentState
+   - Builds initial AgentState from ticket_data
+   - Invokes graph with config={"configurable": {"thread_id": ticket_id}}
+   - Returns final state
+   - Logs total processing time with structlog
+## Phase 3 — API Routes
+**Prompt 3.1 — Authentication routes**
+Build production JWT authentication in app/api/v1/routes/auth.py.
+Endpoints:
+POST /auth/register
+  - Validate email uniqueness
+  - Hash password with bcrypt rounds=12
+  - Store User document
+  - Return user (no password)
+POST /auth/login
+  - Verify credentials
+  - Generate access_token (JWT, 30min expiry) and refresh_token (JWT, 7 days)
+  - Store refresh_token in Redis with key "refresh:{user_id}" and 7-day TTL
+  - Update last_login
+  - Return {access_token, refresh_token, token_type: "bearer", user}
+POST /auth/refresh
+  - Validate refresh_token from Redis
+  - Issue new access_token
+  - Rotate refresh_token (delete old, store new)
+POST /auth/logout
+  - Delete refresh_token from Redis
+  - Add access_token to Redis blocklist with remaining TTL
+In app/core/security.py:
+- get_current_user dependency: decode JWT, check blocklist in Redis, return User
+- require_role(roles: List[UserRole]) dependency factory
+- All tokens carry: user_id, role, exp, iat, jti (for blocklist)
+**Prompt 3.2 — Ticket routes**
+Build ticket API routes in app/api/v1/routes/tickets.py.
+POST /tickets/
+  - Auth required (any role)
+  - Validate TicketCreateSchema (Pydantic)
+  - Create Ticket document with status=OPEN
+  - Trigger background task: asyncio.create_task(process_ticket_pipeline(ticket))
+  - Return ticket immediately with 202 Accepted
+Background task process_ticket_pipeline(ticket):
+  1. Call orchestrator process_ticket(ticket_data)
+  2. Update Ticket document with all agent outputs
+  3. If priority == CRITICAL or sla_risk > 80:
+       await notification_service.send_discord(ticket)
+       await notification_service.send_email(ticket)
+  4. Cache ticket in Redis with 1-hour TTL
+GET /tickets/
+  - Auth required
+  - Query params: status, priority, vip_only (bool), department, page, page_size (default 20)
+  - Check Redis cache first, fallback to MongoDB
+  - Return paginated response: {items, total, page, pages, has_next, has_prev}
+GET /tickets/{ticket_id}
+  - Return single ticket with full AI reasoning
+PATCH /tickets/{ticket_id}
+  - Support: status update, assigned_agent update
+  - Update updated_at
+  - Emit WebSocket event (see below)
+GET /tickets/{ticket_id}/reasoning
+  - Return detailed explainability: {ai_reasoning, full_explanation, all agent scores}
+WebSocket /ws/tickets
+  - Auth via query param token
+  - Broadcast ticket updates to connected clients
+  - Use Redis pub/sub as broker for multi-instance support
+**Prompt 3.3 — Dashboard and analytics routes**
+Build dashboard and analytics endpoints.
+GET /dashboard/stats
+  Cache in Redis for 60 seconds, key "dashboard:stats:{date}"
+  Return:
+  {
+    today_total: int,
+    today_vip: int,
+    today_critical: int,
+    today_escalated: int,
+    sla_saved: int,              # tickets resolved before SLA deadline
+    open_tickets: int,
+    avg_resolution_hours: float,
+    vip_percentage: float,
+  }
+GET /dashboard/charts/priority-distribution
+  Return: [{priority: "CRITICAL", count: N}, ...]
+  Cache 5 minutes
+GET /dashboard/charts/department-issues
+  Return: [{department: "Finance", count: N}, ...]
+GET /dashboard/charts/escalation-trends
+  Return last 7 days: [{date: "2024-01-01", escalated: N, total: N}, ...]
+GET /dashboard/charts/category-breakdown
+  Return: [{category: string, count: N, percentage: float}, ...]
+GET /dashboard/live-tickets
+  Return top 20 most recent open tickets sorted by priority_score desc
+  Include: ticket_id, employee_name, role, priority, status, sla_risk_score, created_at
+POST /dashboard/export
+  Body: {format: "csv"|"pdf", filters: {...}}
+  Generate and return file download
+  Require MANAGER or ADMIN role
+## Phase 4 — Notification Service
+**Prompt 4.1 — Notification service**
+Build the notification service in app/services/notification_service.py.
+Discord notification:
+async def send_discord(ticket: Ticket) -> bool:
+  Use httpx.AsyncClient to POST to DISCORD_WEBHOOK_URL
+  Payload must use Discord embeds format:
+  {
+    "embeds": [{
+      "title": "🚨 VIP TICKET ALERT" (if vip) or "⚠️ CRITICAL TICKET",
+      "color": 15158332 (red for CRITICAL), 16776960 (yellow for HIGH),
+      "fields": [
+        {name: "Ticket ID", value: ticket.ticket_id, inline: true},
+        {name: "Employee", value: f"{ticket.employee_name} ({ticket.role})", inline: true},
+        {name: "VIP Level", value: ticket.vip_level or "Standard", inline: true},
+        {name: "Issue", value: ticket.issue_title, inline: false},
+        {name: "Priority", value: f"🔴 {ticket.priority}", inline: true},
+        {name: "Assigned Team", value: ticket.assigned_team, inline: true},
+        {name: "SLA Risk", value: f"{ticket.sla_risk_score:.0f}%", inline: true},
+        {name: "AI Reasoning", value: "\n".join(f"✓ {r}" for r in ticket.ai_reasoning[:3]), inline: false},
+      ],
+      "footer": {"text": "VIPulse AI – Intelligent Service Desk"},
+      "timestamp": datetime.utcnow().isoformat(),
+    }]
+  }
+  On failure: log error, return False
+Email notification:
+async def send_email(ticket: Ticket, recipients: List[str] = None) -> bool:
+  Use aiosmtplib with Gmail SMTP (smtp.gmail.com:587, STARTTLS)
+  Recipients: derive from assigned_team mapping or use recipients param
+  Subject: f"[{ticket.priority}] VIP Ticket Escalated – {ticket.ticket_id}"
+  
+  HTML body via Jinja2 template app/templates/email_alert.html:
+  - Professional table layout
+  - Priority badge with color coding
+  - All ticket details
+  - AI reasoning section
+  - SLA risk gauge (text-based)
+  - CTA button linking to dashboard ticket URL
+  
+  On failure: log error, return False
+
+async def notify(ticket: Ticket) -> dict:
+  Run both concurrently: results = await asyncio.gather(send_discord(ticket), send_email(ticket), return_exceptions=True)
+  Return {discord: bool, email: bool}
+
+Phase 5 — React Frontend
+Prompt 5.1 — Frontend scaffold
+Create a production React + Vite + Tailwind frontend for VIPulse AI.
+
+Stack: Vite 5, React 18, TypeScript, Tailwind CSS v3, react-router-dom v6, axios, Chart.js + react-chartjs-2, react-hook-form + zod, zustand (global state), react-query (server state), date-fns, lucide-react (icons)
+
+Folder structure:
+src/
+  api/
+    client.ts          # axios instance with JWT interceptors, refresh token logic
+    tickets.ts
+    auth.ts
+    dashboard.ts
+  components/
+    ui/                # Button, Badge, Card, Input, Modal, Spinner, Toast, Pagination
+    layout/            # Sidebar, Header, PageWrapper
+    tickets/           # TicketForm, TicketCard, TicketTable, AIDecisionPanel, EscalationBadge
+    dashboard/         # StatsCard, PriorityChart, DeptChart, EscalationTrend, LiveTicketFeed
+  pages/
+    Login.tsx
+    Dashboard.tsx
+    SubmitTicket.tsx
+    AIDecision.tsx     # shows after ticket submission
+    Tickets.tsx        # list with filters
+    TicketDetail.tsx
+    Analytics.tsx
+    AdminPanel.tsx     # VIP database management
+  store/
+    authStore.ts       # zustand: user, token, login/logout actions
+    ticketStore.ts
+  hooks/
+    useWebSocket.ts    # real-time ticket updates
+    useAuth.ts
+  types/
+    ticket.ts
+    auth.ts
+    dashboard.ts
+  utils/
+    formatters.ts      # date, currency, priority colors
+    constants.ts
+
+In client.ts:
+- Base URL from VITE_API_URL env variable
+- Request interceptor: attach Authorization: Bearer {token}
+- Response interceptor: on 401, call /auth/refresh, retry original request once; on second 401, logout and redirect to /login
+- All requests include X-Request-ID header (uuid)
+
+Design system (Tailwind config):
+- Primary: slate-900 / slate-50
+- Critical: red-600
+- High: orange-500
+- Medium: amber-400
+- Low: green-500
+- VIP Gold: yellow-500
+- VIP Platinum: purple-600
+- Use dark mode class strategy
+prompt 5.2
+Build all 6 pages of VIPulse AI frontend.
+
+Prerequisites: Frontend scaffold from Prompt 5.1, all API client functions
+
+--- PAGE 1: Login.tsx ---
+Full-screen split layout: left = brand panel with VIPulse AI logo, tagline, feature list
+Right = login form with email/password, react-hook-form + zod validation
+On success: store token in zustand + localStorage, redirect to /dashboard
+Show error toast on invalid credentials
+
+--- PAGE 2: Dashboard.tsx ---
+Top row: 5 StatsCard components (Today's Tickets, VIP Tickets, Critical, Escalated, SLA Saved)
+Each card has icon (lucide), current value, percentage change from yesterday
+Second row: 2-column grid
+  Left: Priority Distribution doughnut chart (Chart.js)
+  Right: Department Issues bar chart
+Third row: Escalation Trends line chart (7 days)
+Fourth row: Live Ticket Feed table (top 10 by priority_score)
+  Columns: ID, Employee, Role, Priority badge, Team, SLA Risk progress bar, Status, Actions
+  VIP rows highlighted with left yellow border
+Auto-refresh every 30s via react-query
+WebSocket connection for real-time new ticket toast notifications
+
+--- PAGE 3: SubmitTicket.tsx ---
+Multi-field form with react-hook-form:
+  Employee ID (with auto-complete lookup)
+  Employee Name, Role (dropdown), Department (dropdown)
+  Issue Title, Description (textarea, min 20 chars)
+  Severity (radio: Low/Medium/High/Critical)
+  Attachment (file upload, optional, accept image/pdf)
+On submit:
+  Show loading state "AI is analyzing your ticket..."
+  POST to /api/v1/tickets/
+  On success: redirect to /tickets/{id}/decision
+
+--- PAGE 4: AIDecision.tsx ---
+This is your SHOWSTOPPER page. Display immediately after ticket submission.
+
+Layout: centered, max-w-4xl
+
+Top section:
+  Ticket ID, employee details, timestamp
+  Animated priority badge (pulse animation for CRITICAL)
+
+4-column metrics row:
+  VIP Confidence: circular progress gauge (SVG)
+  Priority Score: large number with color
+  SLA Risk: semicircular gauge
+  Urgency Level: badge
+
+AI Reasoning panel:
+  Animated reveal: each reasoning bullet appears with 200ms delay stagger
+  Each bullet: checkmark icon + text
+  "Powered by LangGraph Multi-Agent AI" subtitle
+
+Team Routing card:
+  Assigned team with team icon
+  Routing reason text from AI
+
+Notification Status:
+  Discord: sent/pending badge
+  Email: sent/pending badge
+
+--- PAGE 5: Analytics.tsx ---
+Date range picker (last 7/30/90 days)
+Category breakdown table with percentages
+Avg resolution time by team
+SLA breach risk heatmap by department + priority
+Top 5 employees by ticket frequency
+
+--- PAGE 6: AdminPanel.tsx ---
+VIP Employee management
+Table: employee_id, name, role, dept, vip_level, edit/delete
+Add/edit modal with form
+CSV bulk import
+Require ADMIN role (redirect otherwise)
+
+Build Order Summary
+Run these prompts in sequence — each phase depends on the previous:
+
+Prompt 1.1 → Backend scaffold & config
+Prompt 1.2 → MongoDB Beanie models
+Prompt 2.1 → Agent state + base class
+Prompt 2.2 → All 6 agents
+Prompt 2.3 → LangGraph StateGraph wiring
+Prompt 3.1 → Auth routes
+Prompt 3.2 → Ticket routes + WebSocket
+Prompt 3.3 → Dashboard + analytics routes
+Prompt 4.1 → Notification service (Discord + Email)
+Prompt 5.1 → React frontend scaffold
+Prompt 5.2 → All 6 UI pages

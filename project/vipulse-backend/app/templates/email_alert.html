@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VIPulse AI Alert</title>
+  <!--
+    Inline styles only — most email clients strip <style> blocks.
+    Tested layout for Gmail, Outlook, Apple Mail.
+  -->
+</head>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:Arial,Helvetica,sans-serif;color:#1a1a2e;">
+
+  <!-- Outer wrapper -->
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:24px 0;">
+    <tr>
+      <td align="center">
+
+        <!-- Card -->
+        <table width="620" cellpadding="0" cellspacing="0"
+               style="background:#ffffff;border-radius:8px;overflow:hidden;
+                      box-shadow:0 2px 12px rgba(0,0,0,0.08);max-width:620px;width:100%;">
+
+          <!-- ── Header ── -->
+          <tr>
+            <td style="background:{{ header_color }};padding:28px 32px;">
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td>
+                    <span style="font-size:26px;font-weight:700;color:#ffffff;letter-spacing:-0.5px;">
+                      {{ header_icon }} VIPulse AI
+                    </span>
+                    <br/>
+                    <span style="font-size:13px;color:rgba(255,255,255,0.8);margin-top:4px;display:block;">
+                      Intelligent Service Desk · Automated Alert
+                    </span>
+                  </td>
+                  <td align="right">
+                    <!-- Priority badge -->
+                    <span style="background:rgba(255,255,255,0.2);color:#ffffff;
+                                 font-size:13px;font-weight:700;letter-spacing:1px;
+                                 padding:6px 14px;border-radius:20px;display:inline-block;">
+                      {{ priority_label }}
+                    </span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- ── Alert title ── -->
+          <tr>
+            <td style="padding:24px 32px 0 32px;">
+              <p style="margin:0;font-size:18px;font-weight:700;color:#1a1a2e;">
+                {{ alert_title }}
+              </p>
+              <p style="margin:6px 0 0 0;font-size:14px;color:#6b7280;">
+                {{ issue_title }}
+              </p>
+            </td>
+          </tr>
+
+          <!-- ── VIP banner (only shown for VIP tickets) ── -->
+          {% if vip_detected %}
+          <tr>
+            <td style="padding:16px 32px 0 32px;">
+              <table width="100%" cellpadding="12" cellspacing="0"
+                     style="background:linear-gradient(135deg,#7c3aed,#a855f7);
+                            border-radius:6px;">
+                <tr>
+                  <td style="color:#ffffff;font-size:13px;font-weight:600;">
+                    👑 &nbsp; VIP EMPLOYEE DETECTED &nbsp;·&nbsp;
+                    Level: <strong>{{ vip_level }}</strong> &nbsp;·&nbsp;
+                    Confidence: <strong>{{ vip_confidence_pct }}%</strong>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          {% endif %}
+
+          <!-- ── Details grid ── -->
+          <tr>
+            <td style="padding:20px 32px;">
+              <table width="100%" cellpadding="0" cellspacing="0">
+
+                <!-- Row 1 -->
+                <tr>
+                  <td width="50%" style="padding-bottom:12px;vertical-align:top;">
+                    <p style="margin:0;font-size:11px;font-weight:700;color:#9ca3af;
+                               text-transform:uppercase;letter-spacing:0.8px;">Ticket ID</p>
+                    <p style="margin:4px 0 0 0;font-size:14px;font-weight:600;
+                               color:#1a1a2e;font-family:monospace;">{{ ticket_id }}</p>
+                  </td>
+                  <td width="50%" style="padding-bottom:12px;vertical-align:top;">
+                    <p style="margin:0;font-size:11px;font-weight:700;color:#9ca3af;
+                               text-transform:uppercase;letter-spacing:0.8px;">Employee</p>
+                    <p style="margin:4px 0 0 0;font-size:14px;font-weight:600;color:#1a1a2e;">
+                      {{ employee_name }}
+                    </p>
+                    <p style="margin:2px 0 0 0;font-size:12px;color:#6b7280;">
+                      {{ role }} · {{ department }}
+                    </p>
+                  </td>
+                </tr>
+
+                <!-- Row 2 -->
+                <tr>
+                  <td width="50%" style="padding-bottom:12px;vertical-align:top;">
+                    <p style="margin:0;font-size:11px;font-weight:700;color:#9ca3af;
+                               text-transform:uppercase;letter-spacing:0.8px;">Category</p>
+                    <p style="margin:4px 0 0 0;font-size:14px;color:#1a1a2e;">
+                      {{ category }}{% if subcategory %} / {{ subcategory }}{% endif %}
+                    </p>
+                  </td>
+                  <td width="50%" style="padding-bottom:12px;vertical-align:top;">
+                    <p style="margin:0;font-size:11px;font-weight:700;color:#9ca3af;
+                               text-transform:uppercase;letter-spacing:0.8px;">Assigned Team</p>
+                    <p style="margin:4px 0 0 0;font-size:14px;color:#1a1a2e;">
+                      {{ assigned_team }}
+                    </p>
+                  </td>
+                </tr>
+
+                <!-- Row 3 -->
+                <tr>
+                  <td width="50%" style="padding-bottom:12px;vertical-align:top;">
+                    <p style="margin:0;font-size:11px;font-weight:700;color:#9ca3af;
+                               text-transform:uppercase;letter-spacing:0.8px;">Priority Score</p>
+                    <p style="margin:4px 0 0 0;font-size:14px;font-weight:600;color:{{ priority_color }};">
+                      {{ priority_score }}/100
+                      <span style="color:#6b7280;font-weight:400;font-size:12px;">
+                        · {{ urgency_level | upper }}
+                      </span>
+                    </p>
+                  </td>
+                  <td width="50%" style="padding-bottom:12px;vertical-align:top;">
+                    <p style="margin:0;font-size:11px;font-weight:700;color:#9ca3af;
+                               text-transform:uppercase;letter-spacing:0.8px;">Business Impact</p>
+                    <p style="margin:4px 0 0 0;font-size:14px;color:#1a1a2e;">
+                      {{ business_impact | title }}
+                    </p>
+                  </td>
+                </tr>
+
+              </table>
+            </td>
+          </tr>
+
+          <!-- ── Divider ── -->
+          <tr>
+            <td style="padding:0 32px;">
+              <hr style="border:none;border-top:1px solid #e5e7eb;margin:0;" />
+            </td>
+          </tr>
+
+          <!-- ── SLA Risk gauge ── -->
+          <tr>
+            <td style="padding:20px 32px;">
+              <p style="margin:0 0 10px 0;font-size:11px;font-weight:700;color:#9ca3af;
+                         text-transform:uppercase;letter-spacing:0.8px;">
+                SLA Risk · {{ sla_risk_level }}
+              </p>
+
+              <!-- Progress bar (text-based, works in all email clients) -->
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="background:#e5e7eb;border-radius:4px;overflow:hidden;height:10px;">
+                    <div style="width:{{ sla_risk_score | int }}%;
+                                background:{{ sla_bar_color }};
+                                height:10px;border-radius:4px;">
+                    </div>
+                  </td>
+                  <td width="50" align="right"
+                      style="font-size:13px;font-weight:700;color:{{ sla_bar_color }};
+                             padding-left:10px;white-space:nowrap;">
+                    {{ sla_risk_score | int }}%
+                  </td>
+                </tr>
+              </table>
+
+              <p style="margin:8px 0 0 0;font-size:12px;color:#6b7280;">
+                SLA deadline: <strong>{{ sla_deadline_str }}</strong>
+                {% if sla_deadline_hours %}· {{ sla_deadline_hours }}h window{% endif %}
+              </p>
+            </td>
+          </tr>
+
+          <!-- ── Divider ── -->
+          <tr>
+            <td style="padding:0 32px;">
+              <hr style="border:none;border-top:1px solid #e5e7eb;margin:0;" />
+            </td>
+          </tr>
+
+          <!-- ── AI Reasoning ── -->
+          <tr>
+            <td style="padding:20px 32px;">
+              <p style="margin:0 0 12px 0;font-size:11px;font-weight:700;color:#9ca3af;
+                         text-transform:uppercase;letter-spacing:0.8px;">
+                🤖 AI Reasoning
+              </p>
+              {% for bullet in ai_reasoning %}
+              <table width="100%" cellpadding="0" cellspacing="0"
+                     style="margin-bottom:8px;">
+                <tr>
+                  <td width="20" valign="top"
+                      style="font-size:13px;color:#7c3aed;padding-top:1px;">✓</td>
+                  <td style="font-size:13px;color:#374151;line-height:1.5;">
+                    {{ bullet }}
+                  </td>
+                </tr>
+              </table>
+              {% endfor %}
+
+              {% if full_explanation %}
+              <p style="margin:14px 0 0 0;font-size:13px;color:#6b7280;
+                         font-style:italic;line-height:1.6;
+                         border-left:3px solid #e5e7eb;padding-left:12px;">
+                {{ full_explanation }}
+              </p>
+              {% endif %}
+            </td>
+          </tr>
+
+          <!-- ── CTA button ── -->
+          <tr>
+            <td style="padding:4px 32px 32px 32px;" align="center">
+              <a href="{{ ticket_url }}"
+                 style="display:inline-block;background:{{ header_color }};
+                        color:#ffffff;font-size:14px;font-weight:700;
+                        text-decoration:none;padding:13px 36px;
+                        border-radius:6px;letter-spacing:0.3px;">
+                View Ticket in Dashboard →
+              </a>
+              <p style="margin:12px 0 0 0;font-size:11px;color:#9ca3af;">
+                {{ ticket_url }}
+              </p>
+            </td>
+          </tr>
+
+          <!-- ── Footer ── -->
+          <tr>
+            <td style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb;">
+              <table width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="font-size:11px;color:#9ca3af;">
+                    VIPulse AI · Intelligent Service Desk &nbsp;·&nbsp;
+                    Generated {{ generated_at }}
+                  </td>
+                  <td align="right" style="font-size:11px;color:#9ca3af;">
+                    This is an automated alert. Do not reply.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+        </table>
+        <!-- /Card -->
+
+      </td>
+    </tr>
+  </table>
+
+</body>
+</html>
